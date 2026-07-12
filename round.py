@@ -24,6 +24,14 @@ class Round:
             t.sleep(1)
             self.time -= 1
         self.end_round("Time is up.")
+
+    def skip(self)->bool:
+        """Return True if round skipped and threshold met."""
+        self.skips += 1
+        if self.skips > len(self.players)-2:
+            return True
+        
+        return False
              
 
     def guess(self, player: Player, wrd: str) -> bool:
