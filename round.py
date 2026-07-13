@@ -32,6 +32,13 @@ class Round:
             return True
         
         return False
+    
+    def get_scores(self, player:Player):
+        """gets a specific players scores"""
+        if player in self.player_scores:
+            return self.player_scores[player]
+        else:
+            raise Exception("Player not in score list.")
              
 
     def guess(self, player: Player, wrd: str) -> bool:

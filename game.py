@@ -15,11 +15,10 @@ class Game:
         self.players = players
         self.words_used = []
         self.round = Round(self.get_word())
-        self.board = None
+        self.board = Board()
         self.player_draw_index = 0
         self.connected_thread = thread
         self.start_new_round()
-        self.create_board()
 
     def start_new_round(self)-> None:
         """Starts a new round with a new word."""
@@ -30,8 +29,6 @@ class Game:
             self.round_ended()
             self.end_game()
 
-    def create_board(self):
-        self.board = Board()
 
     def player_guess(self, player: Player, guess: str)-> bool:
         """Makes the player guess the word"""
@@ -53,7 +50,7 @@ class Game:
     def round_ended(self) -> None:
         """If round ends call this"""
         self.start_new_round()
-        self.create_board()
+        self.board.clear()
 
     def update_board(self, x:int, y:int, color:list[int])->None:
         """calls update method on board"""
