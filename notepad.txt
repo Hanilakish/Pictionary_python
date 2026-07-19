@@ -1,0 +1,192 @@
+"""
+Flask-SocketIO entrypoint. Translates socket events <-> Game methods.
+Run with: python app.py
+"""
+
+from flask import Flask, request
+from flask_socketio import SocketIO, join_room, leave_room
+
+from player import Player
+from game_manager import GameManager
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "change-me"
+socketio = SocketIO(app, cors_allowed_origins="*")
+manager = GameManager(socketio)
+
+sid_to_player = {}   # socket id -> Player
+sid_to_room = {}     # socket id -> room_id
+
+
+@socketio.on("join_room")
+def on_join(data):
+    room_id = data["room"]
+    name = data["name"]
+
+    player = Player(sid=request.sid, name=name)
+    sid_to_player[request.sid] = player
+    sid_to_room[request.sid] = room_id
+
+    join_room(room_id)
+    game = manager.get_room(room_id) or manager.create_room(room_id)
+    game.add_player(player)
+
+    # catch the new player up on anything already drawn this round
+    socketio.emit("board_sync", {"actions": game.board.get_actions()}, room=request.sid)
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    player = sid_to_player.pop(request.sid, None)
+    room_id = sid_to_room.pop(request.sid, None)
+    if player and room_id:
+        game = manager.get_room(room_id)
+        if game:
+            game.remove_player(player)
+            leave_room(room_id)
+            manager.remove_room_if_empty(room_id)
+
+
+@socketio.on("choose_word")
+def on_choose_word(data):
+    game, player = _get_game_and_player()
+    if game and player:
+        game.choose_word(player, data["word"])
+
+
+@socketio.on("draw")
+def on_draw(data):
+    game, player = _get_game_and_player()
+    if game and player:
+        game.handle_draw(player, data["x"], data["y"], data["color"], data.get("size", 4))
+
+
+@socketio.on("fill")
+def on_fill(data):
+    game, player = _get_game_and_player()
+    if game and player:
+        game.handle_fill(player, data["x"], data["y"], data["color"])
+
+
+@socketio.on("clear_board")
+def on_clear(_data):
+    game, player = _get_game_and_player()
+    if game and player:
+        game.handle_clear(player)
+
+
+@socketio.on("guess")
+def on_guess(data):
+    game, player = _get_game_and_player()
+    if game and player:
+        game.handle_guess(player, data["text"])
+
+
+@socketio.on("skip_vote")
+def on_skip(_data):
+    game, player = _get_game_and_player()
+    if game and player:
+        game.handle_skip_vote(player)
+
+
+def _get_game_and_player():
+    player = sid_to_player.get(request.sid)
+    room_id = sid_to_room.get(request.sid)
+    game = manager.get_room(room_id) if room_id else None
+    return game, player
+
+
+if __name__ == "__main__":
+    manager.start_loop()
+    socketio.run(app, debug=True, port=5000)
+
+
+
+----------------------------------------------------------------
+
+
+"""
+Represents a player on the server side. Holds identity + per-game score
+state only. Deliberately has NO dependency on Game - that was the source
+of a circular import in the original design, and Player doesn't need to
+know about Game to do its job.
+"""
+import uuid
+
+
+class Player:
+    def __init__(self, sid: str, name: str):
+        self.id = str(uuid.uuid4())
+        self.sid = sid          # socket.io session id, used to route messages
+        self.name = name
+        self.score = 0
+        self.connected = True
+
+    def add_score(self, points: int) -> None:
+        self.score += points
+
+    def reset_score(self) -> None:
+        self.score = 0
+
+    def disconnect(self) -> None:
+        self.connected = False
+
+    def to_dict(self) -> dict:
+        """Serializable view sent to clients."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "score": self.score,
+            "connected": self.connected,
+        }
+
+    def __eq__(self, other):
+        return isinstance(other, Player) and self.id == other.id
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __repr__(self):
+        return f"Player({self.name!r}, score={self.score})"
+
+
+--------------------------------------------------------------------------------
+
+"""
+Owns all active Game rooms and drives a single shared game loop that
+ticks every room once a second (instead of one raw thread per round).
+"""
+
+from game import Game
+
+
+class GameManager:
+    def __init__(self, socketio):
+        self.socketio = socketio
+        self.games = {}   # room_id -> Game
+
+    def create_room(self, room_id: str) -> Game:
+        def broadcast(event, data, to_sid=None):
+            target = to_sid if to_sid else room_id
+            self.socketio.emit(event, data, room=target)
+
+        game = Game(room_id, broadcast)
+        self.games[room_id] = game
+        return game
+
+    def get_room(self, room_id: str):
+        return self.games.get(room_id)
+
+    def remove_room_if_empty(self, room_id: str) -> None:
+        game = self.games.get(room_id)
+        if game and not game.players:
+            del self.games[room_id]
+
+    def start_loop(self) -> None:
+        """One background task ticks every active game every second."""
+        def loop():
+            while True:
+                self.socketio.sleep(1)
+                for game in list(self.games.values()):
+                    game.tick()
+        self.socketio.start_background_task(loop)
