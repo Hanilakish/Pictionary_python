@@ -1,24 +1,31 @@
-
 """
-Stores the state of the drawing board
+Handles a single game room: wires together Player, Board, chat and Round.
 """
 
 class Board:
-    ROWS = COLS = 720
+    WIDTH = HEIGHT = 720
+
     def __init__(self):
-        self.data = self.create_empty_board()
+        self.actions = [] #an ordered list of dict
 
-    def update(self, x, y, color):
-        self.data[y][x] = color
+    def draw(self, x: int, y:int, color:tuple, size: int = 4)-> dict:
+        """Record a single point/segment being drawn."""
+        #tuple(color) is utilized as a safety net just in case the input is of type list.
+        action = {"type": "draw", "x":x, "y":y, "color": tuple(color), "size":size}
+        self.actions.append(action)
+        return action
 
-    def clear(self):
-        self.data = self.create_empty_board()
-
-    def create_empty_board(self):
-        return [[(255, 255, 255) for _ in range(self.COLS)] for _ in range(self.ROWS)]
+    def fill(self, x:int, y:int, color:tuple)->dict:
+        """Record a flood-fill action."""
+        action ={"type":"fill", "x":x, "y":y, "color":tuple(color)}
+        self.actions.append(action)
+        return action
     
-    def fill(self, x, y):
-        pass
+    def clear(self)->None:
+        """Clear the pallet."""
+        self.actions = []
 
-    def get_board(self):
-        return self.data
+    def get_actions(self)-> list:
+        """Send this to players which join mid match such that
+        their canvas can be replayed to the current state."""
+        return self.actions

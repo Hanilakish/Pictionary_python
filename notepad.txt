@@ -190,3 +190,354 @@ class GameManager:
                 for game in list(self.games.values()):
                     game.tick()
         self.socketio.start_background_task(loop)
+
+
+--------------------------------------------------------------------------------
+
+"""
+Handles a single game room: wires together Player, Board, Chat and Round.
+
+Game holds no socket/Flask code directly - socket handlers in app.py call
+these methods, and Game reports what happened back via the `broadcast`
+callback it was given at construction time. This keeps game logic
+framework-agnostic and easy to unit test without spinning up a server.
+"""
+
+from board import Board
+from chat import Chat
+from round import Round
+from word_bank import get_random_word
+
+
+class Game:
+    ROUNDS_PER_PLAYER = 3          # how many times each player gets to draw
+    WORD_CHOICE_COUNT = 3
+
+    def __init__(self, room_id: str, broadcast):
+        """
+        room_id: unique id for this game room
+        broadcast: callable(event: str, data: dict, to_sid: str = None)
+                   to_sid=None broadcasts to the whole room; otherwise the
+                   event goes only to that player's socket.
+        """
+        self.room_id = room_id
+        self.broadcast = broadcast
+        self.players = []
+        self.board = Board()
+        self.chat = Chat()
+        self.round = None
+        self.words_used = []
+        self.draw_order = []
+        self.draw_index = 0
+        self.rounds_played = 0
+        self.state = "waiting"          # waiting|choosing_word|drawing|round_end|game_end
+        self._pending_drawer = None
+        self._pending_choices = []
+
+    # ---- players ---------------------------------------------------
+    def add_player(self, player) -> None:
+        self.players.append(player)
+        self.broadcast("player_joined", {"player": player.to_dict()})
+        if self.state == "waiting" and len(self.players) >= 2:
+            self.start_game()
+
+    def remove_player(self, player) -> None:
+        if player not in self.players:
+            return
+        self.players.remove(player)
+        if player in self.draw_order:
+            self.draw_order.remove(player)
+        self.broadcast("player_left", {"player": player.to_dict()})
+
+        if self.round and not self.round.ended:
+            if self.round.player_left(player):
+                self._finish_round()
+        if len(self.players) < 2:
+            self.state = "waiting"
+
+    # ---- game / round flow ------------------------------------------
+    def start_game(self) -> None:
+        self.rounds_played = 0
+        self.words_used = []
+        self.draw_order = list(self.players)
+        self.draw_index = 0
+        for p in self.players:
+            p.reset_score()
+        self._start_next_round()
+
+    def _start_next_round(self) -> None:
+        total_rounds = self.ROUNDS_PER_PLAYER * max(len(self.draw_order), 1)
+        if self.rounds_played >= total_rounds:
+            self._end_game()
+            return
+
+        self.board.clear()
+        drawer = self.draw_order[self.draw_index % len(self.draw_order)]
+        self.draw_index += 1
+        self.rounds_played += 1
+
+        choices = get_random_word(exclude=self.words_used, count=self.WORD_CHOICE_COUNT)
+        self.state = "choosing_word"
+        self._pending_drawer = drawer
+        self._pending_choices = choices
+
+        self.broadcast("choose_word", {"choices": choices}, to_sid=drawer.sid)
+        self.broadcast("waiting_for_word", {"drawer": drawer.to_dict()})
+
+    def choose_word(self, player, word: str) -> bool:
+        """Called when the drawer picks a word (or a timeout auto-picks one)."""
+        if self.state != "choosing_word" or player != self._pending_drawer:
+            return False
+        if word not in self._pending_choices:
+            word = self._pending_choices[0]
+
+        self.words_used.append(word)
+        self.round = Round(word, player, self.players)
+        self.state = "drawing"
+        self.broadcast("round_started", {"round": self.round.to_dict()})
+        self.broadcast("your_word", {"word": word}, to_sid=player.sid)
+        return True
+
+    def tick(self) -> None:
+        """Call once a second from the shared game loop (GameManager)."""
+        if self.state != "drawing" or not self.round:
+            return
+        just_ended = self.round.tick()
+        self.broadcast("time_update", {"time_left": self.round.time_left})
+        if just_ended:
+            self._finish_round()
+
+    def _finish_round(self) -> None:
+        self.state = "round_end"
+        self.broadcast("round_ended", {
+            "word": self.round.word,
+            "reason": self.round.end_reason,
+            "scores": [p.to_dict() for p in self.players],
+        })
+        self.round = None
+        self._start_next_round()
+
+    def _end_game(self) -> None:
+        self.state = "game_end"
+        ranked = sorted(self.players, key=lambda p: p.score, reverse=True)
+        self.broadcast("game_ended", {"scores": [p.to_dict() for p in ranked]})
+
+    # ---- gameplay actions --------------------------------------------
+    def handle_draw(self, player, x: int, y: int, color, size: int = 4) -> None:
+        if not self.round or player != self.round.drawer:
+            return
+        action = self.board.draw(x, y, color, size)
+        self.broadcast("board_update", action)
+
+    def handle_fill(self, player, x: int, y: int, color) -> None:
+        if not self.round or player != self.round.drawer:
+            return
+        action = self.board.fill(x, y, color)
+        self.broadcast("board_update", action)
+
+    def handle_clear(self, player) -> None:
+        if not self.round or player != self.round.drawer:
+            return
+        self.board.clear()
+        self.broadcast("board_cleared", {})
+
+    def handle_guess(self, player, text: str) -> None:
+        if not self.round:
+            return
+        correct = self.round.guess(player, text)
+        if correct:
+            position = len(self.round.guessed_correctly) - 1
+            points = self.round.score_for_guess_order(position)
+            player.add_score(points)
+            self.round.drawer.add_score(max(10, points // 4))  # drawer gets a cut too
+
+            msg = self.chat.add_message(player.name, "guessed the word!", correct_guess=True)
+            self.broadcast("chat_message", msg)
+            self.broadcast("correct_guess", {"player": player.to_dict()})
+
+            if self.round.ended:
+                self._finish_round()
+        else:
+            msg = self.chat.add_message(player.name, text)
+            self.broadcast("chat_message", msg)
+
+    def handle_skip_vote(self, player) -> None:
+        if not self.round:
+            return
+        if self.round.vote_skip(player):
+            self._finish_round()
+
+----------------------------------------------------------
+"""
+Stores chat messages for a room.
+
+Correct-guess detection needs the secret word, which only Round/Game
+know - so Chat stays a dumb message store and Game tells it whether a
+message was a correct guess. This avoids Chat depending on Round.
+"""
+
+
+class Chat:
+    def __init__(self):
+        self.messages = []  # list of dicts: {player, text, correct_guess}
+
+    def add_message(self, player_name: str, text: str, correct_guess: bool = False) -> dict:
+        msg = {"player": player_name, "text": text, "correct_guess": correct_guess}
+        self.messages.append(msg)
+        return msg
+
+    def get_messages(self) -> list:
+        return self.messages
+
+    def clear(self) -> None:
+        self.messages = []
+
+    def __len__(self):
+        return len(self.messages)
+
+    def __str__(self):
+        return "\n".join(f"{m['player']}: {m['text']}" for m in self.messages)
+
+    def __repr__(self):
+        return str(self)
+
+----------------------------------------------------
+"""
+Represents a single round of the game: word, drawer, guesses, timer state.
+
+Round is a pure state machine - no threads, no sockets, no knowledge of
+Game or Chat. The server's shared game loop (see game_manager.py) calls
+tick() once a second. This keeps Round trivially unit-testable and avoids
+fighting Flask-SocketIO's eventlet/gevent threading model with a raw
+_thread per round, which was hard to cancel and easy to leak.
+"""
+
+
+class Round:
+    ROUND_LENGTH = 80              # seconds
+    SKIP_VOTE_FRACTION = 0.5       # fraction of guessers needed to force-skip
+
+    def __init__(self, word: str, drawer, players: list, round_length: int = None):
+        self.word = word
+        self.drawer = drawer
+        self.players = list(players)               # snapshot for this round
+        self.guessers = [p for p in self.players if p != drawer]
+        self.guessed_correctly = []                 # players, in guess order
+        self.skip_votes = set()
+        self.time_left = round_length or self.ROUND_LENGTH
+        self.ended = False
+        self.end_reason = None
+
+    def tick(self) -> bool:
+        """Advance the clock by one second. Returns True if the round just ended."""
+        if self.ended:
+            return False
+        self.time_left -= 1
+        if self.time_left <= 0:
+            self._end("time_up")
+            return True
+        return False
+
+    def guess(self, player, text: str) -> bool:
+        """Returns True if this guess is correct and newly scored."""
+        if self.ended or player == self.drawer or player in self.guessed_correctly:
+            return False
+        correct = text.strip().lower() == self.word.lower()
+        if correct:
+            self.guessed_correctly.append(player)
+            if self.everyone_guessed():
+                self._end("everyone_guessed")
+        return correct
+
+    def everyone_guessed(self) -> bool:
+        return len(self.guessers) > 0 and len(self.guessed_correctly) >= len(self.guessers)
+
+    def vote_skip(self, player) -> bool:
+        """Returns True if this vote just pushed the round past the skip threshold."""
+        if self.ended or player == self.drawer:
+            return False
+        self.skip_votes.add(player)
+        needed = max(1, round(len(self.guessers) * self.SKIP_VOTE_FRACTION))
+        if len(self.skip_votes) >= needed:
+            self._end("skipped")
+            return True
+        return False
+
+    def player_left(self, player) -> bool:
+        """Handle a disconnect mid-round. Returns True if this ended the round."""
+        if player in self.guessers:
+            self.guessers.remove(player)
+        if player in self.guessed_correctly:
+            self.guessed_correctly.remove(player)
+        self.skip_votes.discard(player)
+
+        if player == self.drawer:
+            self._end("drawer_left")
+            return True
+        if self.everyone_guessed():
+            self._end("everyone_guessed")
+            return True
+        return False
+
+    def score_for_guess_order(self, position: int) -> int:
+        """Earlier correct guesses score more. position is 0-indexed."""
+        base, decay, floor = 100, 15, 20
+        return max(base - position * decay, floor)
+
+    def to_dict(self) -> dict:
+        return {
+            "word_hint": self._hint(),
+            "drawer": self.drawer.name,
+            "time_left": self.time_left,
+            "guessed": [p.name for p in self.guessed_correctly],
+        }
+
+    def _hint(self) -> str:
+        """Underscored hint for guessers. The drawer gets the real word
+        separately via a dedicated 'your_word' event."""
+        return " ".join("_" * len(part) for part in self.word.split(" "))
+
+    def _end(self, reason: str) -> None:
+        self.ended = True
+        self.end_reason = reason
+
+-----------------------------------------------------
+"""
+Stores the state of the drawing board.
+
+Rather than keeping a full pixel grid in memory (720*720 tuples per game
+gets expensive fast, and has to be diffed to send incrementally), we
+store the ordered list of draw actions ("strokes"). This is exactly what
+a connected client needs to render the canvas, and what a player who
+joins mid-round needs to catch up - just replay get_actions().
+"""
+
+
+class Board:
+    WIDTH = HEIGHT = 720
+
+    def __init__(self):
+        self.actions = []  # ordered list of dicts describing draw actions
+
+    def draw(self, x: int, y: int, color: tuple, size: int = 4) -> dict:
+        """Record a single point/segment being drawn."""
+        action = {"type": "draw", "x": x, "y": y, "color": tuple(color), "size": size}
+        self.actions.append(action)
+        return action
+
+    def fill(self, x: int, y: int, color: tuple) -> dict:
+        """Record a flood-fill action. The actual flood-fill rasterization
+        happens client-side (the browser canvas already has the pixel
+        data); the server just records and rebroadcasts the action so
+        every client's canvas stays in sync."""
+        action = {"type": "fill", "x": x, "y": y, "color": tuple(color)}
+        self.actions.append(action)
+        return action
+
+    def clear(self) -> None:
+        self.actions = []
+
+    def get_actions(self) -> list:
+        """Full action log - send this to players who join mid-round so
+        their canvas can be replayed to the current state."""
+        return self.actions

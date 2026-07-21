@@ -34,4 +34,7 @@ class Player:
         return isinstance(other, Player) and self.id == other.id
 
     def __hash__(self):
-        return hash(self.id) #explain this stopped here?
+        return hash(self.id) 
+    
+    def __repr__(self):
+        return f"Player({self.name!r}, score={self.score})"
